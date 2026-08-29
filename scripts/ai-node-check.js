@@ -1,95 +1,151 @@
 /*
- * Loon AI 节点实测选择器
+ * Loon AI 节点实测选择器 v2
  *
- * 用法：
- *   full  - 扫描 AI智能优选 中全部候选节点，实测 OpenAI 后选择综合最稳节点。
- *   guard - 只检测当前节点；当前节点失效时才扫描并切换。
+ * 解决的问题：
+ * - Remote Filter（NameRegex）不会被 $config.getSubPolicies() 稳定展开，因此旧版脚本可能读不到候选节点。
+ * - 本版不再尝试枚举 Remote Filter。
+ * - 改为读取多个“AI探测组”当前实际选中的真实节点，再逐个实测 OpenAI。
+ * - 最后把 AI智能优选 固定到胜出的真实节点，避免 Codex 因 url-test 子组自动切换而重连。
  *
- * 目标：减少 Codex 因节点抖动、OpenAI 地区限制或频繁换节点导致的重连。
+ * 模式：
+ * full  = 检查当前节点 + 各 AI 探测组候选节点，选择综合最稳节点。
+ * guard = 只检测当前 AI 节点；当前节点失效时才执行 full。
  */
 
 const POLICY = "AI智能优选";
+
+// 这些组必须存在于 [Proxy Group]。
+// 每个组由 Loon 自己从对应 Remote Filter 中挑一个候选节点。
+const PROBE_GROUPS = [
+  "AI探测日韩",
+  "AI探测亚洲",
+  "AI探测欧洲",
+  "AI探测美加澳",
+  "AI探测高速"
+];
+
 const API_URL = "https://api.openai.com/v1/models";
 const CHATGPT_URL = "https://chatgpt.com/";
-const REQUEST_TIMEOUT = 6000;
-const CONCURRENCY = 8;
+const REQUEST_TIMEOUT = 6500;
+const CONCURRENCY = 5;
 const KEEP_CURRENT_MARGIN_MS = 250;
-const MODE = String($argument || "full").trim().toLowerCase();
+const MODE = String($argument || "full").replace(/^\"|\"$/g, "").trim().toLowerCase();
+
+function now() {
+  return Date.now();
+}
 
 function str(v) {
   return String(v == null ? "" : v);
 }
 
-function apiOK(status, body) {
-  const b = str(body).toLowerCase();
-  if (b.includes("unsupported_country")) return false;
-  if (b.includes("unsupported country")) return false;
-  if (b.includes("country, region, or territory")) return false;
-  // 401 说明已经成功抵达 OpenAI API，只是没有提供 API Key。
-  // 429 说明已经成功抵达 OpenAI，只是被限流。
+function lower(v) {
+  return str(v).toLowerCase();
+}
+
+function isBuiltIn(name) {
+  return !name || name === "DIRECT" || name === "REJECT" || name === POLICY;
+}
+
+function apiReachable(status, body) {
+  const b = lower(body);
+
+  if (b.indexOf("unsupported_country") !== -1) return false;
+  if (b.indexOf("unsupported country") !== -1) return false;
+  if (b.indexOf("country, region, or territory") !== -1) return false;
+
+  // 401：已经成功到达 OpenAI API，只是没有 API Key。
+  // 429：同样已经到达 OpenAI，只是服务端限流。
   return status === 200 || status === 401 || status === 429;
 }
 
-function webOK(status) {
+function chatgptReachable(status) {
   return status >= 200 && status < 400;
 }
 
-function request(method, url, node) {
+function apiProbe(node) {
   return new Promise((resolve) => {
-    const started = Date.now();
-    const options = {
-      url,
-      node,
+    const start = now();
+
+    $httpClient.get({
+      url: API_URL,
       timeout: REQUEST_TIMEOUT,
+      node: node,
       "auto-redirect": false,
       "auto-cookie": false,
       alpn: "h2",
       headers: {
-        "Accept": "application/json,text/html,*/*",
+        "Accept": "application/json",
         "User-Agent": "Mozilla/5.0"
       }
-    };
+    }, (error, response, data) => {
+      const ms = now() - start;
+      const status = response ? response.status : 0;
 
-    const callback = (error, response, data) => {
       resolve({
+        ok: !error && apiReachable(status, data),
+        ms,
+        status,
         error: error ? str(error) : "",
-        status: response ? response.status : 0,
-        body: str(data),
-        ms: Date.now() - started
+        body: str(data)
       });
-    };
-
-    if (method === "HEAD") $httpClient.head(options, callback);
-    else $httpClient.get(options, callback);
+    });
   });
 }
 
-async function probeNode(node) {
-  const a1 = await request("GET", API_URL, node);
-  const w1 = await request("HEAD", CHATGPT_URL, node);
-  const a2 = await request("GET", API_URL, node);
+function chatgptProbe(node) {
+  return new Promise((resolve) => {
+    const start = now();
 
-  const ok1 = !a1.error && apiOK(a1.status, a1.body);
-  const okw = !w1.error && webOK(w1.status);
-  const ok2 = !a2.error && apiOK(a2.status, a2.body);
+    $httpClient.head({
+      url: CHATGPT_URL,
+      timeout: REQUEST_TIMEOUT,
+      node: node,
+      "auto-redirect": false,
+      "auto-cookie": false,
+      alpn: "h2",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Safari/537.36"
+      }
+    }, (error, response) => {
+      const ms = now() - start;
+      const status = response ? response.status : 0;
+
+      resolve({
+        ok: !error && chatgptReachable(status),
+        ms,
+        status,
+        error: error ? str(error) : ""
+      });
+    });
+  });
+}
+
+async function testNode(node) {
+  // 两次 API + 一次 ChatGPT，降低偶发成功节点被误选的概率。
+  const a1 = await apiProbe(node);
+  const w1 = await chatgptProbe(node);
+  const a2 = await apiProbe(node);
+
+  const apiSuccess = (a1.ok ? 1 : 0) + (a2.ok ? 1 : 0);
+  const webSuccess = w1.ok ? 1 : 0;
 
   const times = [];
-  if (ok1) times.push(a1.ms);
-  if (okw) times.push(w1.ms);
-  if (ok2) times.push(a2.ms);
+  if (a1.ok) times.push(a1.ms);
+  if (w1.ok) times.push(w1.ms);
+  if (a2.ok) times.push(a2.ms);
 
   const avg = times.length
     ? Math.round(times.reduce((a, b) => a + b, 0) / times.length)
     : 99999;
+
   const jitter = times.length > 1
-    ? Math.max(...times) - Math.min(...times)
+    ? Math.max.apply(null, times) - Math.min.apply(null, times)
     : 99999;
 
-  const apiSuccess = (ok1 ? 1 : 0) + (ok2 ? 1 : 0);
-  const webSuccess = okw ? 1 : 0;
   const strictOK = apiSuccess === 2 && webSuccess === 1;
 
-  // 越低越好。提高抖动权重，优先选择适合 Codex 长连接的稳定线路。
+  // 抖动权重大于纯延迟，优先照顾 Codex 长连接稳定性。
   const score = strictOK
     ? avg + jitter * 1.8
     : 100000 + (2 - apiSuccess) * 20000 + (1 - webSuccess) * 20000 + avg;
@@ -102,117 +158,138 @@ async function probeNode(node) {
     avg,
     jitter,
     score,
-    detail: {
-      api1: { status: a1.status, ms: a1.ms, error: a1.error },
-      chatgpt: { status: w1.status, ms: w1.ms, error: w1.error },
-      api2: { status: a2.status, ms: a2.ms, error: a2.error }
+    details: {
+      api1: { ok: a1.ok, ms: a1.ms, status: a1.status, error: a1.error },
+      chatgpt: { ok: w1.ok, ms: w1.ms, status: w1.status, error: w1.error },
+      api2: { ok: a2.ok, ms: a2.ms, status: a2.status, error: a2.error }
     }
   };
-}
-
-function getSubPolicies(policy) {
-  return new Promise((resolve) => {
-    try {
-      $config.getSubPolicies(policy, (items) => {
-        resolve(Array.isArray(items) ? items : []);
-      });
-    } catch (_) {
-      resolve([]);
-    }
-  });
-}
-
-async function getNodes() {
-  const nodes = await getSubPolicies(POLICY);
-  return nodes.filter((n, i, arr) =>
-    n &&
-    n !== POLICY &&
-    n !== "DIRECT" &&
-    n !== "REJECT" &&
-    arr.indexOf(n) === i
-  );
 }
 
 async function mapLimit(items, limit, worker) {
   const results = new Array(items.length);
   let cursor = 0;
 
-  async function run() {
+  async function runner() {
     while (true) {
       const i = cursor++;
       if (i >= items.length) return;
+
       try {
         results[i] = await worker(items[i]);
       } catch (e) {
         results[i] = {
-          node: items[i], strictOK: false, apiSuccess: 0, webSuccess: 0,
-          avg: 99999, jitter: 99999, score: 999999, error: str(e)
+          node: items[i],
+          strictOK: false,
+          apiSuccess: 0,
+          webSuccess: 0,
+          avg: 99999,
+          jitter: 99999,
+          score: 999999,
+          error: str(e)
         };
       }
     }
   }
 
-  const jobs = [];
-  for (let i = 0; i < Math.min(limit, items.length); i++) jobs.push(run());
-  await Promise.all(jobs);
+  const workers = [];
+  const count = Math.min(limit, items.length);
+  for (let i = 0; i < count; i++) workers.push(runner());
+  await Promise.all(workers);
   return results;
 }
 
-function eligibleResults(results) {
+function getCandidateNodes() {
+  const candidates = [];
+
+  // 当前 AI 节点也参加比较，避免无意义切换。
+  const current = $config.getSelectedPolicy(POLICY);
+  if (!isBuiltIn(current)) candidates.push(current);
+
+  // 关键修复：不再调用 getSubPolicies() 展开 Remote Filter。
+  // 直接读取各探测组已经选出的真实节点。
+  for (const group of PROBE_GROUPS) {
+    try {
+      const selected = $config.getSelectedPolicy(group);
+      if (!isBuiltIn(selected) && selected !== group) {
+        candidates.push(selected);
+      } else {
+        console.log(`${group} 暂未解析出真实节点：${selected}`);
+      }
+    } catch (e) {
+      console.log(`${group} 读取失败：${str(e)}`);
+    }
+  }
+
+  return candidates.filter((n, i, arr) => n && arr.indexOf(n) === i);
+}
+
+function rankEligible(results) {
   const strict = results
     .filter((x) => x && x.strictOK)
     .sort((a, b) => a.score - b.score);
+
   if (strict.length) return { mode: "严格", list: strict };
 
   const loose = results
     .filter((x) => x && x.apiSuccess >= 1 && x.webSuccess === 1)
     .sort((a, b) => a.score - b.score);
+
   return { mode: "宽松", list: loose };
 }
 
-function persist(results, eligible) {
+function saveResults(results, eligible) {
   try {
     $persistentStore.write(JSON.stringify(results), "ai_node_last_results");
-    $persistentStore.write(JSON.stringify(eligible.map((x) => ({
-      node: x.node,
-      avg: x.avg,
-      jitter: x.jitter,
-      score: Math.round(x.score)
-    }))), "ai_node_valid_list");
+    $persistentStore.write(
+      JSON.stringify(eligible.map((x) => ({
+        node: x.node,
+        avg: x.avg,
+        jitter: x.jitter,
+        score: Math.round(x.score)
+      }))),
+      "ai_node_valid_list"
+    );
   } catch (e) {
-    console.log("保存检测结果失败：" + str(e));
+    console.log("保存结果失败：" + str(e));
   }
 }
 
-async function fullScan(current, notify) {
-  const nodes = await getNodes();
+async function fullScan(notifyAlways) {
+  const current = $config.getSelectedPolicy(POLICY);
+  const nodes = getCandidateNodes();
+
   if (!nodes.length) {
-    throw new Error("AI智能优选 中没有读取到候选节点。请确认全球节点筛选正常。 ");
+    throw new Error("没有读取到 AI 探测组候选节点。请先等待各 AI探测* url-test 组完成一次测速。 ");
   }
 
-  console.log(`开始检测 ${nodes.length} 个 AI 候选节点`);
-  const results = await mapLimit(nodes, CONCURRENCY, probeNode);
-  const ranked = eligibleResults(results);
+  console.log("AI候选真实节点：" + JSON.stringify(nodes));
+  console.log("当前AI节点：" + current);
+
+  const results = await mapLimit(nodes, CONCURRENCY, testNode);
+  const ranked = rankEligible(results);
   const eligible = ranked.list;
-  persist(results, eligible);
+
+  saveResults(results, eligible);
 
   if (!eligible.length) {
     $notification.post(
       "AI节点检测",
       "没有找到可用节点",
-      "候选节点均未通过 OpenAI API + ChatGPT 实测。"
+      `已检测 ${nodes.length} 个区域候选节点，但均未通过 OpenAI API + ChatGPT 实测。`
     );
     return;
   }
 
   const best = eligible[0];
   const currentResult = eligible.find((x) => x.node === current);
+
   let chosen = best;
-  let reason = "选择综合稳定性最佳节点";
+  let reason = "选择综合稳定性最佳真实节点";
 
   if (currentResult && currentResult.score <= best.score + KEEP_CURRENT_MARGIN_MS) {
     chosen = currentResult;
-    reason = "当前节点仍稳定，保持不变以减少 Codex 重连";
+    reason = "当前节点仍属优质节点，保持不变以减少 Codex 重连";
   }
 
   let switched = true;
@@ -220,13 +297,14 @@ async function fullScan(current, notify) {
     switched = $config.getConfig(POLICY, chosen.node);
   }
 
-  const top = eligible.slice(0, 10).map((x, i) =>
-    `${i + 1}. ${x.node}｜均值 ${x.avg}ms｜抖动 ${x.jitter}ms`
-  ).join("\n");
+  const top = eligible.slice(0, 8)
+    .map((x, i) => `${i + 1}. ${x.node}｜均值 ${x.avg}ms｜抖动 ${x.jitter}ms`)
+    .join("\n");
 
-  console.log(`最终节点：${chosen.node}；${reason}`);
+  console.log("最终选择：" + chosen.node);
+  console.log("原因：" + reason);
 
-  if (notify) {
+  if (notifyAlways) {
     $notification.post(
       "AI节点检测完成",
       `${ranked.mode}可用 ${eligible.length}/${nodes.length}`,
@@ -235,35 +313,43 @@ async function fullScan(current, notify) {
   }
 }
 
-async function guard() {
+async function guardCurrent() {
   const current = $config.getSelectedPolicy(POLICY);
-  if (!current || current === POLICY) {
-    await fullScan(current || "", false);
+
+  if (isBuiltIn(current)) {
+    console.log("当前 AI 节点无效，执行候选扫描。 ");
+    await fullScan(false);
     return;
   }
 
-  const result = await probeNode(current);
+  console.log("守护检测当前节点：" + current);
+  const result = await testNode(current);
+
   if (result.strictOK) {
-    console.log(`当前AI节点正常：${current}｜均值 ${result.avg}ms｜抖动 ${result.jitter}ms`);
+    console.log(`当前节点稳定：${current}｜均值 ${result.avg}ms｜抖动 ${result.jitter}ms`);
     return;
   }
 
   $notification.post(
     "AI节点守护",
     "当前节点异常",
-    `${current} 未通过稳定性检测，开始寻找替代节点。`
+    `${current} 未通过 OpenAI 稳定性检测，将重新选择候选节点。`
   );
-  await fullScan(current, false);
+
+  await fullScan(false);
 }
 
 async function main() {
-  if (MODE === "guard") await guard();
-  else await fullScan($config.getSelectedPolicy(POLICY) || "", true);
+  if (MODE === "guard") {
+    await guardCurrent();
+  } else {
+    await fullScan(true);
+  }
 }
 
 main()
   .catch((e) => {
-    console.log("AI节点检测失败：" + str(e));
+    console.log("AI节点检测错误：" + str(e));
     $notification.post("AI节点检测失败", "", str(e));
   })
   .finally(() => $done());
