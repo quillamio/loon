@@ -1,0 +1,25 @@
+#!name = OpenAI / Codex 稳定加速
+#!desc = 无脚本、无复写、无 MitM。将 OpenAI / ChatGPT / Codex 核心域名固定走插件 PROXY；安装后把 PROXY 选择为主配置中的“AI智能优选”。重点减少域名分流不一致和 Codex WebSocket 重连。
+#!author = quillamio
+#!homepage = https://github.com/quillamio/loon
+#!system = iOS,iPadOS,macOS
+#!tag = AI,OpenAI,Codex,稳定
+#!type = normal
+
+[Rule]
+# ChatGPT / Codex WebSocket 与核心站点
+DOMAIN,ws.chatgpt.com,PROXY
+DOMAIN-SUFFIX,chatgpt.com,PROXY
+
+# OpenAI 核心域名
+DOMAIN-SUFFIX,openai.com,PROXY
+DOMAIN-SUFFIX,oaistatic.com,PROXY
+DOMAIN-SUFFIX,oaiusercontent.com,PROXY
+DOMAIN-SUFFIX,oaistatsig.com,PROXY
+
+# 官方网络依赖中的核心认证/静态资源
+DOMAIN,cdn.openaimerge.com,PROXY
+DOMAIN-SUFFIX,workos.com,PROXY
+DOMAIN-SUFFIX,workoscdn.com,PROXY
+DOMAIN,workos.imgix.net,PROXY
+DOMAIN,challenges.cloudflare.com,PROXY
