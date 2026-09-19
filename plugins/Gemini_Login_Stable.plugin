@@ -1,0 +1,25 @@
+#!name = Gemini 登录稳定
+#!desc = 无脚本、无复写、无 MitM。将 Gemini 网页、Google 登录、验证码与关键静态资源固定走同一个插件 PROXY；安装后把 PROXY 映射到主配置中的“Gemini稳定登录”。遇到地区错误或 /sorry/ 时，请在该策略组内更换低滥用率的原生/家宽节点，并在登录期间保持节点不变。
+#!author = quillamio
+#!homepage = https://github.com/quillamio/loon
+#!system = iOS,iPadOS,macOS
+#!tag = AI,Gemini,Google,登录,稳定
+#!type = normal
+
+[Rule]
+# Gemini 网页与 AI 服务
+DOMAIN,gemini.google.com,PROXY
+DOMAIN,aistudio.google.com,PROXY
+DOMAIN,bard.google.com,PROXY
+DOMAIN-SUFFIX,ai.google,PROXY
+DOMAIN-SUFFIX,googleapis.com,PROXY
+
+# Google 账号、地区判定与验证码必须保持同一出口
+DOMAIN,accounts.google.com,PROXY
+DOMAIN,myaccount.google.com,PROXY
+DOMAIN,www.google.com,PROXY
+DOMAIN-SUFFIX,google.com,PROXY
+DOMAIN-SUFFIX,gstatic.com,PROXY
+DOMAIN-SUFFIX,googleusercontent.com,PROXY
+DOMAIN-SUFFIX,ggpht.com,PROXY
+DOMAIN-SUFFIX,recaptcha.net,PROXY
